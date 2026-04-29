@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 DB_PATH = os.getenv("DB_PATH", "training_bot.db")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","8653934626:AAGSdUCMjI1pTMmkTJkN4vrWczQ6THMZgKU")
 
-SESSION_DATE, CUSTOM_EXERCISE_NAME, SESSION_QUICK_INPUT, SESSION_MANUAL_INPUT, SESSION_RPE, SESSION_NOTES = range(6)
+SESSION_DATE, CUSTOM_EXERCISE_NAME, SESSION_QUICK_INPUT, SESSION_MANUAL_INPUT, SESSION_RPE, SESSION_NOTES, SESSION_EDIT = range(7)
 
 PROGRAMS = {
     "A": {
@@ -309,13 +309,22 @@ def build_main_menu():
         [InlineKeyboardButton("Dashboard", callback_data="dashboard_open"), InlineKeyboardButton("Экспорт Excel", callback_data="export_open")],
     ])
 
-def build_day_menu(day):
-    rows = [[InlineKeyboardButton(ex["exercise"], callback_data=f"pick::{ex['exercise']}")] for ex in PROGRAMS.get(day, {}).get("exercises", [])]
+def build_day_menu(day, done_exercises=None):
+    done = set(done_exercises or [])
+    rows = []
+    for ex in PROGRAMS.get(day, {}).get("exercises", []):
+        label = ("✅ " if ex["exercise"] in done else "") + ex["exercise"]
+        rows.append([InlineKeyboardButton(label, callback_data=f"pick::{ex['exercise']}")])
     rows.append([InlineKeyboardButton("Каталог всех упражнений", callback_data="catalog::0")])
     rows.append([InlineKeyboardButton("Добавить своё упражнение", callback_data="custom_exercise")])
+    rows.append([InlineKeyboardButton("✏️ Редактировать упражнение", callback_data="edit_exercise")])
     rows.append([InlineKeyboardButton("Завершить тренировку", callback_data="finish_workout")])
     rows.append([InlineKeyboardButton("В меню", callback_data="go_menu")])
     return InlineKeyboardMarkup(rows)
+
+def get_done_exercises(user_id, day, workout_date):
+    rows = get_session_rows(user_id, day, workout_date)
+    return set(r["exercise"] for r in rows)
 
 def build_catalog_menu(page):
     start = page * PAGE_SIZE
@@ -342,7 +351,29 @@ def build_input_mode_menu(has_last):
     rows.append([InlineKeyboardButton("Назад к упражнениям", callback_data="back_to_day_menu")])
     return InlineKeyboardMarkup(rows)
 
-def build_workout_summary(user_id, day, workout_date):
+def build_edit_select_menu(session_rows):
+    """Inline keyboard: pick which exercise from current session to edit."""
+    rows = []
+    for r in session_rows:
+        sets_str = ", ".join(
+            f"{r[f'set{i}_reps']:g}x{r[f'set{i}_kg']:g}"
+            for i in range(1, 6)
+            if r[f"set{i}_reps"] is not None and r[f"set{i}_kg"] is not None
+        )
+        label = f"{r['exercise']} [{sets_str}]"
+        rows.append([InlineKeyboardButton(label, callback_data=f"edit_pick::{r['id']}")])
+    rows.append([InlineKeyboardButton("Назад к упражнениям", callback_data="back_to_day_menu")])
+    return InlineKeyboardMarkup(rows)
+
+def build_edit_field_menu(row_id):
+    """Inline keyboard: choose what to edit for selected exercise row."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Изменить подходы (повторения×кг)", callback_data=f"edit_sets::{row_id}")],
+        [InlineKeyboardButton("Изменить заметку", callback_data=f"edit_notes::{row_id}")],
+        [InlineKeyboardButton("Назад к списку", callback_data="edit_exercise")],
+    ])
+
+
     rows = get_session_rows(user_id, day, workout_date)
     if not rows:
         return f"Тренировка завершена ✅\nДата: {workout_date}\nДень: {day}"
@@ -469,7 +500,9 @@ async def menu_callback(update, context):
         if not day:
             await q.message.reply_text("Сначала начни тренировку.", reply_markup=build_main_menu())
             return ConversationHandler.END
-        await q.message.reply_text(f"Упражнения дня {day}:", reply_markup=build_day_menu(day))
+        workout_date = context.user_data.get("workout_date", "")
+        done = get_done_exercises(update.effective_user.id, day, workout_date)
+        await q.message.reply_text(f"Упражнения дня {day}:", reply_markup=build_day_menu(day, done))
         return SESSION_MANUAL_INPUT
     if data.startswith("catalog::"):
         page = int(data.split("::", 1)[1])
@@ -524,6 +557,37 @@ async def menu_callback(update, context):
     if data == "manual_input":
         await q.message.reply_text("Введи подходы вручную. Пример:\n8x60, 8x60, 7x62.5, 6x62.5")
         return SESSION_MANUAL_INPUT
+    if data == "edit_exercise":
+        day = context.user_data.get("selected_day")
+        workout_date = context.user_data.get("workout_date", "")
+        if not day or not workout_date:
+            await q.message.reply_text("Нет активной тренировки.")
+            return ConversationHandler.END
+        session_rows = get_session_rows(update.effective_user.id, day, workout_date)
+        if not session_rows:
+            await q.message.reply_text("В этой тренировке ещё нет записей для редактирования.")
+            return SESSION_MANUAL_INPUT
+        await q.message.reply_text("Выбери упражнение для редактирования:", reply_markup=build_edit_select_menu(session_rows))
+        return SESSION_MANUAL_INPUT
+    if data.startswith("edit_pick::"):
+        row_id = int(data.split("::", 1)[1])
+        context.user_data["edit_row_id"] = row_id
+        await q.message.reply_text("Что хочешь изменить?", reply_markup=build_edit_field_menu(row_id))
+        return SESSION_MANUAL_INPUT
+    if data.startswith("edit_sets::"):
+        row_id = int(data.split("::", 1)[1])
+        context.user_data["edit_row_id"] = row_id
+        context.user_data["edit_field"] = "sets"
+        await q.message.reply_text(
+            "Введи новые подходы в формате:\n8x60, 8x60, 7x62.5\n\nМожно указать от 1 до 5 подходов."
+        )
+        return SESSION_EDIT
+    if data.startswith("edit_notes::"):
+        row_id = int(data.split("::", 1)[1])
+        context.user_data["edit_row_id"] = row_id
+        context.user_data["edit_field"] = "notes"
+        await q.message.reply_text("Введи новую заметку (или '-' чтобы очистить):")
+        return SESSION_EDIT
     return ConversationHandler.END
 
 async def session_date(update, context):
@@ -533,9 +597,10 @@ async def session_date(update, context):
         await update.message.reply_text(str(e))
         return SESSION_DATE
     day = context.user_data["selected_day"]
+    done = get_done_exercises(update.effective_user.id, day, context.user_data["workout_date"])
     await update.message.reply_text(
         f"Готово. День {day} | дата: {context.user_data['workout_date']}\nТеперь выбирай упражнения в любом порядке:",
-        reply_markup=build_day_menu(day),
+        reply_markup=build_day_menu(day, done),
     )
     return SESSION_MANUAL_INPUT
 
@@ -576,7 +641,9 @@ async def session_manual_input(update, context):
     if "current_exercise" not in context.user_data:
         day = context.user_data.get("selected_day")
         if day:
-            await update.message.reply_text("Сначала выбери упражнение кнопкой ниже:", reply_markup=build_day_menu(day))
+            workout_date = context.user_data.get("workout_date", "")
+            done = get_done_exercises(update.effective_user.id, day, workout_date)
+            await update.message.reply_text("Сначала выбери упражнение кнопкой ниже:", reply_markup=build_day_menu(day, done))
             return SESSION_MANUAL_INPUT
         await update.message.reply_text("Сначала начни тренировку.", reply_markup=build_main_menu())
         return ConversationHandler.END
@@ -630,10 +697,84 @@ async def session_notes(update, context):
     for key in ["current_exercise", "current_sets", "current_rpe"]:
         context.user_data.pop(key, None)
 
+    done = get_done_exercises(user_id, day, workout_date)
     await update.message.reply_text(
         f"Сохранил: {ex_name} ✅\ne1RM: {e1rm if e1rm is not None else '-'}\nPR: {pr}\nΔ к прошлому лучшему: {delta if delta is not None else '-'}\n\nПодсказка тренера:\n{suggestion}\n\nВыбирай следующее упражнение:",
-        reply_markup=build_day_menu(day),
+        reply_markup=build_day_menu(day, done),
     )
+    return SESSION_MANUAL_INPUT
+
+async def session_edit(update, context):
+    """Handle text input when editing an existing exercise record."""
+    user_id = update.effective_user.id
+    row_id = context.user_data.get("edit_row_id")
+    field = context.user_data.get("edit_field")
+    day = context.user_data.get("selected_day", "")
+    workout_date = context.user_data.get("workout_date", "")
+
+    if not row_id or not field:
+        await update.message.reply_text("Ошибка: нет данных для редактирования.")
+        return ConversationHandler.END
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    if field == "sets":
+        try:
+            sets = parse_sets(update.message.text)
+        except Exception as e:
+            await update.message.reply_text(f"Ошибка: {e}\n\nПримеры: 15x40, 8х67.5, 6 * 67.5, 5 x 67.5")
+            return SESSION_EDIT
+        cur.execute(
+            """UPDATE workouts SET
+               set1_reps=?, set1_kg=?,
+               set2_reps=?, set2_kg=?,
+               set3_reps=?, set3_kg=?,
+               set4_reps=?, set4_kg=?,
+               set5_reps=?, set5_kg=?
+               WHERE id=? AND user_id=?""",
+            (sets[0][0], sets[0][1], sets[1][0], sets[1][1],
+             sets[2][0], sets[2][1], sets[3][0], sets[3][1],
+             sets[4][0], sets[4][1], row_id, user_id)
+        )
+        conn.commit()
+        # Recalculate suggestion/coach_status with updated sets
+        cur.execute("SELECT * FROM workouts WHERE id=?", (row_id,))
+        row = cur.fetchone()
+        if row:
+            cfg = find_exercise_config(day, row["exercise"])
+            suggestion, coach_status = analyze_progress(cfg, sets, row["rpe"])
+            cur.execute(
+                "UPDATE workouts SET suggestion=?, coach_status=? WHERE id=?",
+                (suggestion, coach_status, row_id)
+            )
+            conn.commit()
+        conn.close()
+        context.user_data.pop("edit_row_id", None)
+        context.user_data.pop("edit_field", None)
+        done = get_done_exercises(user_id, day, workout_date)
+        await update.message.reply_text(
+            "✅ Подходы обновлены.\n\nВыбирай следующее упражнение:",
+            reply_markup=build_day_menu(day, done)
+        )
+        return SESSION_MANUAL_INPUT
+
+    elif field == "notes":
+        text = update.message.text.strip()
+        new_notes = None if text == "-" else text
+        cur.execute("UPDATE workouts SET notes=? WHERE id=? AND user_id=?", (new_notes, row_id, user_id))
+        conn.commit()
+        conn.close()
+        context.user_data.pop("edit_row_id", None)
+        context.user_data.pop("edit_field", None)
+        done = get_done_exercises(user_id, day, workout_date)
+        await update.message.reply_text(
+            "✅ Заметка обновлена.\n\nВыбирай следующее упражнение:",
+            reply_markup=build_day_menu(day, done)
+        )
+        return SESSION_MANUAL_INPUT
+
+    conn.close()
     return SESSION_MANUAL_INPUT
 
 async def dashboard_text(message, user_id):
@@ -859,7 +1000,7 @@ def build_application():
 
     conv = ConversationHandler(
         entry_points=[
-            CallbackQueryHandler(menu_callback, pattern=r"^(start_[ABC]|dashboard_open|export_open|finish_workout|go_menu|back_to_day_menu|catalog::\d+|pick::.*|custom_exercise|use_last|quick_input|manual_input)$"),
+            CallbackQueryHandler(menu_callback, pattern=r"^(start_[ABC]|dashboard_open|export_open|finish_workout|go_menu|back_to_day_menu|catalog::\d+|pick::.*|custom_exercise|use_last|quick_input|manual_input|edit_exercise|edit_pick::\d+|edit_sets::\d+|edit_notes::\d+)$"),
             CommandHandler("trainer", start),
         ],
         states={
@@ -868,10 +1009,14 @@ def build_application():
             SESSION_QUICK_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, session_quick_input)],
             SESSION_MANUAL_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, session_manual_input),
-                CallbackQueryHandler(menu_callback, pattern=r"^(finish_workout|go_menu|back_to_day_menu|catalog::\d+|pick::.*|custom_exercise|use_last|quick_input|manual_input)$"),
+                CallbackQueryHandler(menu_callback, pattern=r"^(finish_workout|go_menu|back_to_day_menu|catalog::\d+|pick::.*|custom_exercise|use_last|quick_input|manual_input|edit_exercise|edit_pick::\d+|edit_sets::\d+|edit_notes::\d+)$"),
             ],
             SESSION_RPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, session_rpe)],
             SESSION_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, session_notes)],
+            SESSION_EDIT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, session_edit),
+                CallbackQueryHandler(menu_callback, pattern=r"^(edit_exercise|edit_pick::\d+|edit_sets::\d+|edit_notes::\d+|back_to_day_menu)$"),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
