@@ -309,12 +309,16 @@ def build_main_menu():
         [InlineKeyboardButton("Dashboard", callback_data="dashboard_open"), InlineKeyboardButton("Экспорт Excel", callback_data="export_open")],
     ])
 
-def build_day_menu(day, done_exercises=None):
+def build_day_menu(day, done_exercises=None, context_user_data=None):
     done = set(done_exercises or [])
     rows = []
-    for ex in PROGRAMS.get(day, {}).get("exercises", []):
+    ex_map = {}  # idx -> exercise name
+    for idx, ex in enumerate(PROGRAMS.get(day, {}).get("exercises", [])):
+        ex_map[idx] = ex["exercise"]
         label = ("✅ " if ex["exercise"] in done else "") + ex["exercise"]
-        rows.append([InlineKeyboardButton(label, callback_data=f"pick::{ex['exercise']}")])
+        rows.append([InlineKeyboardButton(label, callback_data=f"pick::{idx}")])
+    if context_user_data is not None:
+        context_user_data["day_ex_map"] = ex_map
     rows.append([InlineKeyboardButton("Каталог всех упражнений", callback_data="catalog::0")])
     rows.append([InlineKeyboardButton("Добавить своё упражнение", callback_data="custom_exercise")])
     rows.append([InlineKeyboardButton("✏️ Редактировать упражнение", callback_data="edit_exercise")])
@@ -326,10 +330,19 @@ def get_done_exercises(user_id, day, workout_date):
     rows = get_session_rows(user_id, day, workout_date)
     return set(r["exercise"] for r in rows)
 
-def build_catalog_menu(page):
+def build_catalog_menu(page, context_user_data=None):
     start = page * PAGE_SIZE
     items = EXERCISE_CATALOG[start:start + PAGE_SIZE]
-    rows = [[InlineKeyboardButton(name, callback_data=f"pick::{name}")] for name in items]
+    rows = []
+    cat_map = {}
+    for local_idx, name in enumerate(items):
+        global_idx = start + local_idx
+        cat_map[global_idx] = name
+        rows.append([InlineKeyboardButton(name, callback_data=f"cat_pick::{global_idx}")])
+    if context_user_data is not None:
+        existing = context_user_data.get("cat_ex_map", {})
+        existing.update(cat_map)
+        context_user_data["cat_ex_map"] = existing
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("◀️ Назад", callback_data=f"catalog::{page-1}"))
@@ -502,17 +515,45 @@ async def menu_callback(update, context):
             return ConversationHandler.END
         workout_date = context.user_data.get("workout_date", "")
         done = get_done_exercises(update.effective_user.id, day, workout_date)
-        await q.message.reply_text(f"Упражнения дня {day}:", reply_markup=build_day_menu(day, done))
+        await q.message.reply_text(f"Упражнения дня {day}:", reply_markup=build_day_menu(day, done, context.user_data))
         return SESSION_MANUAL_INPUT
     if data.startswith("catalog::"):
         page = int(data.split("::", 1)[1])
-        await q.message.reply_text("Каталог упражнений:", reply_markup=build_catalog_menu(page))
+        await q.message.reply_text("Каталог упражнений:", reply_markup=build_catalog_menu(page, context.user_data))
         return SESSION_MANUAL_INPUT
     if data == "custom_exercise":
         await q.message.reply_text("Напиши название своего упражнения:")
         return CUSTOM_EXERCISE_NAME
     if data.startswith("pick::"):
-        ex_name = data.split("::", 1)[1]
+        idx = int(data.split("::", 1)[1])
+        ex_map = context.user_data.get("day_ex_map", {})
+        ex_name = ex_map.get(idx)
+        if not ex_name:
+            # fallback: rebuild map from PROGRAMS
+            day = context.user_data.get("selected_day", "")
+            exercises = PROGRAMS.get(day, {}).get("exercises", [])
+            ex_name = exercises[idx]["exercise"] if idx < len(exercises) else None
+        if not ex_name:
+            await q.message.reply_text("Ошибка: упражнение не найдено.")
+            return SESSION_MANUAL_INPUT
+        context.user_data["current_exercise"] = ex_name
+        day = context.user_data.get("selected_day", "")
+        cfg = find_exercise_config(day, ex_name)
+        prev_row = get_last_same_exercise(update.effective_user.id, ex_name)
+        await q.message.reply_text(
+            f"Выбрано: {ex_name}\nГруппа: {cfg['group']}\nЦель: {cfg['sets'] if cfg['sets'] else '-'} подходов × {cfg['reps']}\nОриентир: {cfg['rpe']}\nШаг прогрессии: {cfg['step']}\n{format_last_performance(prev_row)}\n\nКак хочешь занести данные?",
+            reply_markup=build_input_mode_menu(prev_row is not None),
+        )
+        return SESSION_MANUAL_INPUT
+    if data.startswith("cat_pick::"):
+        idx = int(data.split("::", 1)[1])
+        cat_map = context.user_data.get("cat_ex_map", {})
+        ex_name = cat_map.get(idx)
+        if not ex_name:
+            ex_name = EXERCISE_CATALOG[idx] if idx < len(EXERCISE_CATALOG) else None
+        if not ex_name:
+            await q.message.reply_text("Ошибка: упражнение не найдено.")
+            return SESSION_MANUAL_INPUT
         context.user_data["current_exercise"] = ex_name
         day = context.user_data.get("selected_day", "")
         cfg = find_exercise_config(day, ex_name)
@@ -600,7 +641,7 @@ async def session_date(update, context):
     done = get_done_exercises(update.effective_user.id, day, context.user_data["workout_date"])
     await update.message.reply_text(
         f"Готово. День {day} | дата: {context.user_data['workout_date']}\nТеперь выбирай упражнения в любом порядке:",
-        reply_markup=build_day_menu(day, done),
+        reply_markup=build_day_menu(day, done, context.user_data),
     )
     return SESSION_MANUAL_INPUT
 
@@ -643,7 +684,7 @@ async def session_manual_input(update, context):
         if day:
             workout_date = context.user_data.get("workout_date", "")
             done = get_done_exercises(update.effective_user.id, day, workout_date)
-            await update.message.reply_text("Сначала выбери упражнение кнопкой ниже:", reply_markup=build_day_menu(day, done))
+            await update.message.reply_text("Сначала выбери упражнение кнопкой ниже:", reply_markup=build_day_menu(day, done, context.user_data))
             return SESSION_MANUAL_INPUT
         await update.message.reply_text("Сначала начни тренировку.", reply_markup=build_main_menu())
         return ConversationHandler.END
@@ -700,7 +741,7 @@ async def session_notes(update, context):
     done = get_done_exercises(user_id, day, workout_date)
     await update.message.reply_text(
         f"Сохранил: {ex_name} ✅\ne1RM: {e1rm if e1rm is not None else '-'}\nPR: {pr}\nΔ к прошлому лучшему: {delta if delta is not None else '-'}\n\nПодсказка тренера:\n{suggestion}\n\nВыбирай следующее упражнение:",
-        reply_markup=build_day_menu(day, done),
+        reply_markup=build_day_menu(day, done, context.user_data),
     )
     return SESSION_MANUAL_INPUT
 
@@ -755,7 +796,7 @@ async def session_edit(update, context):
         done = get_done_exercises(user_id, day, workout_date)
         await update.message.reply_text(
             "✅ Подходы обновлены.\n\nВыбирай следующее упражнение:",
-            reply_markup=build_day_menu(day, done)
+            reply_markup=build_day_menu(day, done, context.user_data)
         )
         return SESSION_MANUAL_INPUT
 
@@ -770,7 +811,7 @@ async def session_edit(update, context):
         done = get_done_exercises(user_id, day, workout_date)
         await update.message.reply_text(
             "✅ Заметка обновлена.\n\nВыбирай следующее упражнение:",
-            reply_markup=build_day_menu(day, done)
+            reply_markup=build_day_menu(day, done, context.user_data)
         )
         return SESSION_MANUAL_INPUT
 
@@ -1000,7 +1041,7 @@ def build_application():
 
     conv = ConversationHandler(
         entry_points=[
-            CallbackQueryHandler(menu_callback, pattern=r"^(start_[ABC]|dashboard_open|export_open|finish_workout|go_menu|back_to_day_menu|catalog::\d+|pick::.*|custom_exercise|use_last|quick_input|manual_input|edit_exercise|edit_pick::\d+|edit_sets::\d+|edit_notes::\d+)$"),
+            CallbackQueryHandler(menu_callback, pattern=r"^(start_[ABC]|dashboard_open|export_open|finish_workout|go_menu|back_to_day_menu|catalog::\d+|pick::\d+|cat_pick::\d+|custom_exercise|use_last|quick_input|manual_input|edit_exercise|edit_pick::\d+|edit_sets::\d+|edit_notes::\d+)$"),
             CommandHandler("trainer", start),
         ],
         states={
@@ -1009,7 +1050,7 @@ def build_application():
             SESSION_QUICK_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, session_quick_input)],
             SESSION_MANUAL_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, session_manual_input),
-                CallbackQueryHandler(menu_callback, pattern=r"^(finish_workout|go_menu|back_to_day_menu|catalog::\d+|pick::.*|custom_exercise|use_last|quick_input|manual_input|edit_exercise|edit_pick::\d+|edit_sets::\d+|edit_notes::\d+)$"),
+                CallbackQueryHandler(menu_callback, pattern=r"^(finish_workout|go_menu|back_to_day_menu|catalog::\d+|pick::\d+|cat_pick::\d+|custom_exercise|use_last|quick_input|manual_input|edit_exercise|edit_pick::\d+|edit_sets::\d+|edit_notes::\d+)$"),
             ],
             SESSION_RPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, session_rpe)],
             SESSION_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, session_notes)],
