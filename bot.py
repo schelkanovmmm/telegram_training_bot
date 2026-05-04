@@ -322,7 +322,7 @@ def build_day_menu(day, done_exercises=None, context_user_data=None):
     rows.append([InlineKeyboardButton("Каталог всех упражнений", callback_data="catalog::0")])
     rows.append([InlineKeyboardButton("Добавить своё упражнение", callback_data="custom_exercise")])
     rows.append([InlineKeyboardButton("✏️ Редактировать упражнение", callback_data="edit_exercise")])
-    rows.append([InlineKeyboardButton("Завершить тренировку", callback_data="finish_workout")])
+    rows.append([InlineKeyboardButton("📊 Итог тренировки / Выйти", callback_data="finish_workout")])
     rows.append([InlineKeyboardButton("В меню", callback_data="go_menu")])
     return InlineKeyboardMarkup(rows)
 
@@ -352,7 +352,7 @@ def build_catalog_menu(page, context_user_data=None):
         rows.append(nav)
     rows.append([InlineKeyboardButton("К упражнениям дня", callback_data="back_to_day_menu")])
     rows.append([InlineKeyboardButton("Добавить своё упражнение", callback_data="custom_exercise")])
-    rows.append([InlineKeyboardButton("Завершить тренировку", callback_data="finish_workout")])
+    rows.append([InlineKeyboardButton("📊 Итог тренировки / Выйти", callback_data="finish_workout")])
     return InlineKeyboardMarkup(rows)
 
 def build_input_mode_menu(has_last):
@@ -379,7 +379,6 @@ def build_edit_select_menu(session_rows):
     return InlineKeyboardMarkup(rows)
 
 def build_edit_field_menu(row_id):
-    """Inline keyboard: choose what to edit for selected exercise row."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Изменить подходы (повторения×кг)", callback_data=f"edit_sets::{row_id}")],
         [InlineKeyboardButton("Изменить заметку", callback_data=f"edit_notes::{row_id}")],
@@ -387,66 +386,51 @@ def build_edit_field_menu(row_id):
     ])
 
 
+def build_workout_summary(user_id, day, workout_date):
     rows = get_session_rows(user_id, day, workout_date)
     if not rows:
-        return f"Тренировка завершена ✅\nДата: {workout_date}\nДень: {day}"
+        return f"🏁 Тренировка {day} | {workout_date}\nНет записей."
 
     total_volume = round(sum(calc_volume(r) for r in rows), 1)
+    progress_list = []
+    overload_list = []
     scored = []
-    progress = []
-    overload = []
 
     for r in rows:
         tw, rr = calc_top_weight_and_reps(r)
         e1 = calc_e1rm(tw, rr)
         scored.append((r["exercise"], e1 if e1 is not None else 0, calc_volume(r)))
-        status = r["coach_status"] or "unknown"
+        status = r["coach_status"] or ""
         if status == "progress":
-            progress.append(r["exercise"])
-        if status == "overload":
-            overload.append(r["exercise"])
+            progress_list.append(r["exercise"])
+        elif status == "overload":
+            overload_list.append(r["exercise"])
 
-    best_by_e1rm = sorted(scored, key=lambda x: x[1], reverse=True)[:3]
     best_by_volume = sorted(scored, key=lambda x: x[2], reverse=True)[:3]
 
     lines = [
-        "✅ Итог тренировки",
-        f"Дата: {workout_date}",
-        f"День: {day}",
-        f"Упражнений занесено: {len(rows)}",
-        f"Тоннаж: {total_volume} кг",
+        f"🏁 Тренировка {day} | {workout_date} завершена!",
+        f"Упражнений: {len(rows)} | Тоннаж: {total_volume} кг",
         "",
-        "Лучшие упражнения по e1RM:",
+        "Топ по тоннажу:",
     ]
+    for ex, _, vol in best_by_volume:
+        lines.append(f"• {ex}: {vol:g} кг")
 
-    if best_by_e1rm and any(x[1] > 0 for x in best_by_e1rm):
-        for ex, e1, vol in best_by_e1rm:
-            lines.append(f"• {ex}: {e1}")
-    else:
-        lines.append("• Недостаточно данных")
-
-    lines.append("")
-    lines.append("Лидеры по тоннажу:")
-    for ex, e1, vol in best_by_volume:
-        lines.append(f"• {ex}: {vol} кг")
-
-    lines.append("")
-    lines.append("Где был прогресс:")
-    if progress:
-        for ex in progress[:6]:
+    if progress_list:
+        lines.append("")
+        lines.append("Прогресс:")
+        for ex in progress_list[:5]:
             lines.append(f"• {ex}")
-    else:
-        lines.append("• Явного прогресса сегодня не зафиксировано")
 
-    lines.append("")
-    lines.append("Где был перегруз:")
-    if overload:
-        for ex in overload[:6]:
+    if overload_list:
+        lines.append("")
+        lines.append("Перегруз:")
+        for ex in overload_list[:5]:
             lines.append(f"• {ex}")
-    else:
-        lines.append("• Перегруза не обнаружено")
 
     return "\n".join(lines)
+
 
 async def start(update, context):
     text = "Привет. Это v6.1.\n\nТеперь после завершения тренировки бот выводит итог: тоннаж, лучшие упражнения, где был прогресс и где был перегруз."
