@@ -31,8 +31,7 @@ logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=lo
 logger = logging.getLogger(__name__)
 
 DB_PATH = os.getenv("DB_PATH", "training_bot.db")
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","8653934626:AAHc_hYdOEBuskBwyyPa-uctWuTl1cwRHuE")
 
 SESSION_DATE, CUSTOM_EXERCISE_NAME, SESSION_QUICK_INPUT, SESSION_MANUAL_INPUT, SESSION_RPE, SESSION_NOTES, SESSION_EDIT, AI_CHAT, MEASURE_INPUT, NUTRITION_INPUT, IMPORT_SCALE, IMPORT_HEALTH = range(12)
 
